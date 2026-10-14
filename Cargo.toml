@@ -1,0 +1,46 @@
+[package]
+name = "metrics-exporter-serialized"
+version = "0.1.0"
+authors = [
+    "ApertureC Team <aperturec@zetier.com>",
+    "Joe Kale <joe@zetier.com>",
+]
+edition = "2024"
+rust-version = "1.85"
+description = "Serialized metric events with optional compression and recorder replay."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Zetier/metrics-exporter-serialized"
+readme = "README.md"
+categories = ["development-tools::debugging"]
+keywords = ["metrics", "telemetry", "compression", "exporter", "recorder"]
+
+[features]
+default = ["async-runtime"]
+async-runtime = ["dep:atomic-waker", "dep:blocking", "dep:futures-io", "dep:futures-lite"]
+
+[dependencies]
+atomic-waker = { version = "1", default-features = false, optional = true }
+blocking = { version = "1", default-features = false, optional = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures-io = { version = "0.3", default-features = false, features = ["std"], optional = true }
+futures-lite = { version = "2", default-features = false, features = ["std"], optional = true }
+metrics = "0.24.6"
+metrics-util = { version = "0.20", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["derive", "std"] }
+thiserror = { version = "2", default-features = false }
+
+[build-dependencies]
+prost-build = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "io-util"] }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
+
+[[example]]
+name = "stream"
+required-features = ["async-runtime"]
+
+[package.metadata.docs.rs]
+all-features = true

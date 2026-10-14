@@ -1,0 +1,19 @@
+name: Rust Common Setup
+description: Install Rust, protoc, and a Cargo cache
+
+inputs:
+  components:
+    description: Rustup components to install
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+    - name: Install protoc
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+    - name: Cache Cargo
+      uses: Swatinem/rust-cache@v2

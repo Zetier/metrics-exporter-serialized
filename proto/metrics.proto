@@ -1,0 +1,89 @@
+syntax = "proto3";
+package metrics.serialized.v1;
+
+enum CompressionScheme {
+  COMPRESSION_UNSPECIFIED = 0;
+  UNCOMPRESSED = 1;
+  DEFLATE = 2;
+}
+
+message EnvelopeHeader {
+  uint64 payload_length = 1;
+  CompressionScheme scheme = 3;
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  COUNTER = 1;
+  GAUGE = 2;
+  HISTOGRAM = 3;
+}
+
+message Description {
+  MetricKind kind = 1;
+  string name = 2;
+  optional string unit = 3;
+  string description = 4;
+}
+
+enum MetricLevel {
+  METRIC_LEVEL_UNSPECIFIED = 0;
+  TRACE = 1;
+  DEBUG = 2;
+  INFO = 3;
+  WARN = 4;
+  ERROR = 5;
+}
+
+message Metadata {
+  string target = 1;
+  MetricLevel level = 2;
+  optional string module_path = 3;
+}
+
+message Label {
+  string key = 1;
+  string value = 2;
+}
+
+message Registration {
+  string name = 1;
+  repeated Label labels = 2;
+  Metadata metadata = 3;
+}
+
+message Event {
+  oneof payload {
+    Description description = 1;
+    Emission emission = 2;
+  }
+}
+
+message Emission {
+  Registration registration = 1;
+  oneof operation {
+    CounterOperation counter = 2;
+    GaugeOperation gauge = 3;
+    HistogramObservation histogram = 4;
+  }
+}
+
+message CounterOperation {
+  oneof operation {
+    uint64 increment = 1;
+    uint64 absolute = 2;
+  }
+}
+
+message GaugeOperation {
+  oneof operation {
+    double increment = 1;
+    double decrement = 2;
+    double set = 3;
+  }
+}
+
+message HistogramObservation {
+  double value = 1;
+  uint64 count = 2;
+}
