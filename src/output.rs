@@ -30,8 +30,20 @@ fn capture_pending(shared: &Shared) -> Option<Vec<Event>> {
             return None;
         }
         state.descriptions_changed = false;
-        let descriptions: Vec<_> = state.descriptions.values().cloned().collect();
-        let emissions = state.take_emissions();
+        let descriptions: Vec<_> = state
+            .descriptions
+            .values()
+            .filter(|description| state.allows(description.name.as_str()))
+            .cloned()
+            .collect();
+        let emissions: Vec<_> = state
+            .take_emissions()
+            .into_iter()
+            .filter(|emission| state.allows(emission.registration.key.name()))
+            .collect();
+        if descriptions.is_empty() && emissions.is_empty() {
+            return None;
+        }
         (descriptions, emissions)
     };
     Some(
@@ -95,7 +107,8 @@ fn write_events(
 /// Exports finite batches of serialized metrics asynchronously.
 ///
 /// This is the sole consumer of its recorder's pending metrics. Dropping it may discard
-/// unexported data; recording continues.
+/// unexported data. For session recorders, dropping it also stops collection; otherwise
+/// recording continues.
 #[cfg(feature = "async-runtime")]
 #[derive(Debug)]
 pub struct Output {
@@ -106,11 +119,13 @@ pub struct Output {
 /// Exports finite batches of serialized metrics synchronously.
 ///
 /// This is the sole consumer of its recorder's pending metrics. Dropping it may discard
-/// unexported data; recording continues. Use blocking exports outside async tasks.
+/// unexported data. For session recorders, dropping it also stops collection; otherwise
+/// recording continues. Use blocking exports outside async tasks.
 #[derive(Debug)]
 pub struct BlockingOutput {
     shared: Arc<Shared>,
     compression: Compression,
+    session: bool,
 }
 
 #[cfg(feature = "async-runtime")]
@@ -125,6 +140,27 @@ pub fn new_blocking(shared: Arc<Shared>, compression: Compression) -> BlockingOu
     BlockingOutput {
         shared,
         compression,
+        session: false,
+    }
+}
+
+pub fn new_session(shared: Arc<Shared>, compression: Compression) -> BlockingOutput {
+    BlockingOutput {
+        shared,
+        compression,
+        session: true,
+    }
+}
+
+impl Drop for BlockingOutput {
+    fn drop(&mut self) {
+        if self.session {
+            self.shared
+                .state
+                .lock()
+                .expect("metric buffer lock poisoned")
+                .end_session();
+        }
     }
 }
 
@@ -262,7 +298,8 @@ impl AsyncRead for Reader<Output> {
 mod tests {
     use super::*;
     use crate::{
-        DeflateLevel, Operation, Recorder, ReplayOutcome, decoder::BlockingDecoder, recorder,
+        Builder, DeflateLevel, Operation, Recorder, ReplayOutcome, decoder::BlockingDecoder,
+        recorder,
     };
     use flate2::read::DeflateDecoder;
     #[cfg(feature = "async-runtime")]
@@ -380,11 +417,71 @@ mod tests {
         let events = capture_pending(&output.inner.shared).unwrap();
         let compression = output.inner.compression;
         let (release, wait) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
         output.pending = Some(blocking::unblock(move || {
+            started.send(()).unwrap();
             wait.recv().unwrap();
             encode_events(events.iter().map(proto::Event::from), compression)
         }));
+        ready.recv().unwrap();
         release
+    }
+
+    #[cfg(feature = "async-runtime")]
+    #[test]
+    fn dropping_a_session_abandons_in_flight_compression_before_reconnecting() {
+        future::block_on(async {
+            let recorder = Builder::new().build_session_recorder();
+            let counter = counter(&recorder);
+            let mut first = recorder.start_session().unwrap();
+            counter.increment(7);
+            let release = pause_encoding(&mut first);
+            assert!(future::poll_once(first.export_pending()).await.is_none());
+            counter.increment(50);
+            drop(first);
+            counter.increment(100);
+            let mut second = recorder.start_session().unwrap();
+            counter.increment(3);
+            release.send(()).unwrap();
+            assert_eq!(
+                second.export_pending().await.unwrap().unwrap(),
+                envelope(3, Compression::default())
+            );
+            assert!(second.export_pending().await.unwrap().is_none());
+        });
+    }
+
+    #[cfg(feature = "async-runtime")]
+    #[test]
+    fn filtering_does_not_rewrite_an_already_captured_batch() {
+        future::block_on(async {
+            let (recorder, mut output) = Builder::new().build();
+            let counter = counter(&recorder);
+            counter.increment(7);
+            let release = pause_encoding(&mut output);
+            recorder.set_filter(|_| false);
+            counter.increment(100);
+            release.send(()).unwrap();
+            assert_eq!(
+                output.export_pending().await.unwrap().unwrap(),
+                envelope(7, Compression::default())
+            );
+            assert!(output.export_pending().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn dropping_continuous_output_does_not_stop_recording() {
+        let (recorder, output) = Builder::new().build_blocking();
+        let counter = counter(&recorder);
+        drop(output);
+        counter.increment(7);
+        assert_eq!(
+            encode_pending(&recorder::shared(&recorder), Compression::default())
+                .unwrap()
+                .unwrap(),
+            envelope(7, Compression::default())
+        );
     }
 
     #[cfg(feature = "async-runtime")]

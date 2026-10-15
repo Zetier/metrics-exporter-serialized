@@ -34,6 +34,31 @@ impl Builder {
         (recorder, output)
     }
 
+    /// Builds an initially disconnected recorder whose handles survive output sessions.
+    ///
+    /// Descriptions are retained while disconnected; emissions are ignored until
+    /// [`Recorder::start_session_blocking`] or `Recorder::start_session` creates an output.
+    ///
+    /// ```
+    /// use metrics_exporter_serialized::Builder;
+    ///
+    /// let recorder = Builder::new().build_session_recorder();
+    /// recorder.set_filter(|name| !name.starts_with("private_"));
+    /// let counter = metrics::with_local_recorder(&recorder, || metrics::counter!("requests"));
+    /// let mut output = recorder.start_session_blocking()?;
+    /// counter.increment(7);
+    /// let _bytes = output.export_pending()?.unwrap();
+    /// drop(output);
+    /// counter.increment(100); // Disconnected emissions are ignored.
+    /// let mut output = recorder.start_session_blocking()?;
+    /// counter.increment(3); // The same handle now records into fresh session state.
+    /// let _bytes = output.export_pending()?.unwrap();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn build_session_recorder(self) -> Recorder {
+        recorder::session_recorder(self.compression)
+    }
+
     /// Installs the global recorder and returns asynchronous output.
     #[cfg(feature = "async-runtime")]
     pub fn install(self) -> Result<Output, Error> {

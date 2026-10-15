@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, Condvar, Mutex},
 };
 
@@ -10,10 +11,41 @@ use metrics::{
 
 use metrics_util::MetricKind as Kind;
 
-use crate::{Description, Emission, Operation, Registration};
+#[cfg(feature = "async-runtime")]
+use crate::Output;
+use crate::{BlockingOutput, Compression, Description, Emission, Operation, Registration, output};
+
+/// Errors when starting an output session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SessionError {
+    /// The recorder was not built with [`crate::Builder::build_session_recorder`].
+    #[error("recorder does not use output sessions")]
+    NotSessionRecorder,
+    /// The previous output or its live reader is still alive.
+    #[error("an output session is already active")]
+    AlreadyActive,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum Collection {
+    #[default]
+    Continuous,
+    Idle,
+    Active,
+}
+
+struct Filter(Box<dyn Fn(&str) -> bool + Send + Sync>);
+
+impl fmt::Debug for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Filter").finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct State {
+    collection: Collection,
+    filter: Option<Filter>,
     pub descriptions_changed: bool,
     counters: HashMap<Key, Current<u64>>,
     gauges: HashMap<Key, Current<f64>>,
@@ -22,11 +54,28 @@ pub struct State {
 }
 
 impl State {
+    pub fn allows(&self, name: &str) -> bool {
+        self.filter.as_ref().is_none_or(|filter| (filter.0)(name))
+    }
+
+    fn clear_emissions(&mut self) {
+        self.counters.clear();
+        self.gauges.clear();
+        self.histograms.clear();
+    }
+
+    pub fn end_session(&mut self) {
+        self.collection = Collection::Idle;
+        self.clear_emissions();
+        self.descriptions_changed = false;
+    }
+
     pub fn has_pending(&self) -> bool {
-        self.descriptions_changed
-            || self.counters.values().any(|current| current.dirty)
-            || self.gauges.values().any(|current| current.dirty)
-            || !self.histograms.is_empty()
+        self.collection != Collection::Idle
+            && (self.descriptions_changed
+                || self.counters.values().any(|current| current.dirty)
+                || self.gauges.values().any(|current| current.dirty)
+                || !self.histograms.is_empty())
     }
 
     pub fn take_emissions(&mut self) -> Vec<Emission> {
@@ -127,9 +176,65 @@ impl Shared {
 #[derive(Clone, Debug, Default)]
 pub struct Recorder {
     shared: Arc<Shared>,
+    compression: Compression,
 }
 
 impl Recorder {
+    /// Starts a fresh asynchronous output session, preserving registered handles and descriptions.
+    /// See [`Self::start_session_blocking`] for lifecycle and error behavior.
+    #[cfg(feature = "async-runtime")]
+    pub fn start_session(&self) -> Result<Output, SessionError> {
+        self.start_session_blocking().map(output::new)
+    }
+
+    /// Starts a fresh output session with zero counter/gauge state and no pending observations.
+    ///
+    /// Only session recorders support this operation. A previous output (or its live reader)
+    /// must be dropped first. Dropping this output stops collection and discards pending data;
+    /// disconnected emissions are ignored. Descriptions and the admission filter survive.
+    /// Bytes already returned to the caller are not recalled or retried.
+    pub fn start_session_blocking(&self) -> Result<BlockingOutput, SessionError> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .expect("metric buffer lock poisoned");
+        match state.collection {
+            Collection::Continuous => return Err(SessionError::NotSessionRecorder),
+            Collection::Active => return Err(SessionError::AlreadyActive),
+            Collection::Idle => {}
+        }
+        state.clear_emissions();
+        state.descriptions_changed = !state.descriptions.is_empty();
+        state.collection = Collection::Active;
+        Ok(output::new_session(
+            Arc::clone(&self.shared),
+            self.compression,
+        ))
+    }
+
+    /// Replaces name-based admission for operations through both new and cached handles.
+    ///
+    /// Rejected operations do not update aggregates. Captures also filter descriptions and
+    /// pending emissions; already captured batches are unaffected. Previously admitted
+    /// counter/gauge values remain until the session ends. Descriptions are retained even
+    /// when excluded, so allowing a name later restores its description.
+    ///
+    /// The predicate runs under the recorder lock and must not record metrics or reenter the
+    /// recorder. Use this method to change policy; `|_| true` restores admission of all names.
+    pub fn set_filter(&self, filter: impl Fn(&str) -> bool + Send + Sync + 'static) {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("metric buffer lock poisoned");
+            state.filter = Some(Filter(Box::new(filter)));
+            state.descriptions_changed = true;
+        }
+        self.shared.notify();
+    }
+
     fn describe(&self, kind: Kind, name: KeyName, unit: Option<Unit>, text: SharedString) {
         let description = Description {
             kind,
@@ -159,6 +264,19 @@ impl Recorder {
                 module_path: metadata.module_path().map(str::to_owned),
             }),
         })
+    }
+}
+
+pub fn session_recorder(compression: Compression) -> Recorder {
+    Recorder {
+        shared: Arc::new(Shared {
+            state: Mutex::new(State {
+                collection: Collection::Idle,
+                ..State::default()
+            }),
+            ..Shared::default()
+        }),
+        compression,
     }
 }
 
@@ -206,6 +324,9 @@ impl Handle {
                 .state
                 .lock()
                 .expect("metric buffer lock poisoned");
+            if state.collection == Collection::Idle || !state.allows(self.registration.key.name()) {
+                return;
+            }
             match operation {
                 Operation::IncrementCounter(value) => {
                     Current::update(&mut state.counters, &self.registration, |current| {
@@ -281,13 +402,186 @@ impl HistogramFn for Handle {
 #[cfg(test)]
 mod tests {
     use crate::decoder::BlockingDecoder;
-    use metrics::Level;
+    use metrics::{Label, Level};
 
     use super::*;
-    use crate::Event;
+    use crate::{Builder, Event, ReplayOutcome};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     fn emissions(recorder: &Recorder) -> Vec<Emission> {
         recorder.shared.state.lock().unwrap().take_emissions()
+    }
+
+    #[test]
+    fn sessions_reset_values_and_pending_observations_but_reuse_handles_and_descriptions() {
+        let recorder = Builder::new().build_session_recorder();
+        let (counter, gauge, histogram) = metrics::with_local_recorder(&recorder, || {
+            metrics::describe_counter!("requests", Unit::Count, "Requests");
+            (
+                metrics::counter!("requests", "route" => "test"),
+                metrics::gauge!("load"),
+                metrics::histogram!("latency"),
+            )
+        });
+        counter.increment(100);
+        gauge.set(100.0);
+        histogram.record(100.0);
+        let mut first = recorder.start_session_blocking().unwrap();
+        counter.increment(10);
+        gauge.set(10.0);
+        histogram.record(10.0);
+        let bytes = first.export_pending().unwrap().unwrap();
+        let destination = DebuggingRecorder::new();
+        let mut decoder = BlockingDecoder::new(bytes.as_slice());
+        while decoder.replay_next_with(&destination, |key| key).unwrap() == ReplayOutcome::Replayed
+        {
+        }
+        let snapshot = destination.snapshotter().snapshot().into_vec();
+        assert_eq!(
+            snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == "requests")
+                .unwrap()
+                .3,
+            DebugValue::Counter(10)
+        );
+        counter.increment(50);
+        gauge.set(50.0);
+        histogram.record(50.0);
+        drop(first);
+        counter.increment(100);
+        gauge.set(100.0);
+        histogram.record(100.0);
+
+        let mut second = recorder.start_session_blocking().unwrap();
+        counter.increment(3);
+        gauge.increment(2.0);
+        histogram.record_many(0.5, 3);
+        let bytes = second.export_pending().unwrap().unwrap();
+        let destination = DebuggingRecorder::new();
+        let mut decoder = BlockingDecoder::new(bytes.as_slice());
+        while decoder.replay_next_with(&destination, |key| key).unwrap() == ReplayOutcome::Replayed
+        {
+        }
+        let snapshot = destination.snapshotter().snapshot().into_vec();
+        assert_eq!(snapshot.len(), 3);
+        for (name, expected) in [
+            ("requests", DebugValue::Counter(3)),
+            ("load", DebugValue::Gauge(2.0.into())),
+            ("latency", DebugValue::Histogram(vec![0.5.into(); 3])),
+        ] {
+            let (key, unit, description, value) = snapshot
+                .iter()
+                .find(|(key, ..)| key.key().name() == name)
+                .unwrap();
+            assert_eq!(*value, expected);
+            if name == "requests" {
+                assert_eq!(*unit, Some(Unit::Count));
+                assert_eq!(description.as_deref(), Some("Requests"));
+                assert_eq!(
+                    key.key().labels().cloned().collect::<Vec<_>>(),
+                    [Label::new("route", "test")]
+                );
+            }
+        }
+        assert!(second.export_pending().unwrap().is_none());
+    }
+
+    #[test]
+    fn output_sessions_are_exclusive_across_clones_and_live_readers() {
+        let recorder = Builder::new().build_session_recorder();
+        let reader = recorder.start_session_blocking().unwrap().into_reader();
+        assert_eq!(
+            recorder.clone().start_session_blocking().unwrap_err(),
+            SessionError::AlreadyActive
+        );
+        drop(reader);
+        let _next = recorder.start_session_blocking().unwrap();
+        assert_eq!(
+            Recorder::default().start_session_blocking().unwrap_err(),
+            SessionError::NotSessionRecorder
+        );
+    }
+
+    #[test]
+    fn replacing_admission_filters_cached_handle_operations_before_aggregation() {
+        let (recorder, mut output) = Builder::new().build_blocking();
+        let (counter, gauge, histogram) = metrics::with_local_recorder(&recorder, || {
+            (
+                metrics::counter!("requests"),
+                metrics::gauge!("load"),
+                metrics::histogram!("latency"),
+            )
+        });
+        counter.increment(1);
+        gauge.set(1.0);
+        histogram.record(1.0);
+        recorder.set_filter(|_| false);
+        counter.absolute(100);
+        counter.increment(100);
+        gauge.set(100.0);
+        gauge.increment(100.0);
+        gauge.decrement(100.0);
+        histogram.record_many(100.0, 5);
+        recorder.set_filter(|_| true);
+        counter.increment(2);
+        gauge.increment(2.0);
+        histogram.record_many(2.0, 2);
+
+        let bytes = output.export_pending().unwrap().unwrap();
+        let destination = DebuggingRecorder::new();
+        let mut decoder = BlockingDecoder::new(bytes.as_slice());
+        while decoder.replay_next_with(&destination, |key| key).unwrap() == ReplayOutcome::Replayed
+        {
+        }
+        let snapshot = destination.snapshotter().snapshot().into_vec();
+        for (name, expected) in [
+            ("requests", DebugValue::Counter(3)),
+            ("load", DebugValue::Gauge(3.0.into())),
+        ] {
+            assert_eq!(
+                snapshot
+                    .iter()
+                    .find(|(key, ..)| key.key().name() == name)
+                    .unwrap()
+                    .3,
+                expected
+            );
+        }
+        let DebugValue::Histogram(values) = &snapshot
+            .iter()
+            .find(|(key, ..)| key.key().name() == "latency")
+            .unwrap()
+            .3
+        else {
+            panic!("expected histogram")
+        };
+        assert_eq!(values.len(), 3);
+        assert_eq!(values.iter().filter(|value| **value == 1.0).count(), 1);
+        assert_eq!(values.iter().filter(|value| **value == 2.0).count(), 2);
+    }
+
+    #[test]
+    fn captures_filter_pending_metrics_but_retain_excluded_descriptions() {
+        let recorder = Builder::new().build_session_recorder();
+        recorder.describe_counter("secret".into(), Some(Unit::Count), "Private".into());
+        let mut output = recorder.start_session_blocking().unwrap();
+        metrics::with_local_recorder(&recorder, || metrics::counter!("secret").increment(7));
+        recorder.set_filter(|name| name != "secret");
+        assert!(output.export_pending().unwrap().is_none());
+        drop(output);
+        let mut output = recorder.start_session_blocking().unwrap();
+        assert!(output.export_pending().unwrap().is_none());
+        recorder.set_filter(|_| true);
+        let bytes = output.export_pending().unwrap().unwrap();
+        let events: Vec<_> = BlockingDecoder::new(bytes.as_slice())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Description(description)]
+            if description.name.as_str() == "secret" && description.unit == Some(Unit::Count) && description.text.as_ref() == "Private")
+        );
+        assert!(output.export_pending().unwrap().is_none());
     }
 
     #[test]
