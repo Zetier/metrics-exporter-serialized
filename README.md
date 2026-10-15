@@ -17,13 +17,7 @@ For a continuous byte stream, consume the output with `into_reader()`. Async I/O
 API uses `BlockingOutput`, `BlockingDecoder`, and `std::io::Read`.
 
 `Decoder::replay_next()` replays one description or emission into the current recorder.
-All replay methods use `metrics::with_recorder()` after decoding each event.
-Use `replay_next_with()` to map metric keys. Description names are mapped as keys without
-labels; apply the same name mapping to descriptions and emissions. Filtering belongs to the
-receiving recorder. `ReplayOutcome::Replayed` means the event was dispatched to that recorder,
-which may filter it out; `EndOfStream` indicates completion. Async replay produces a `Send`
-future when the reader and mapping are `Send`; it does not hold a recorder reference while
-awaiting input.
+Use `replay_next_with()` to map metric keys.
 
 Compression defaults to raw DEFLATE and can be disabled through `Builder::compression()`.
 The decoder reads the compression scheme from the stream. See the [protobuf schema](proto/metrics.proto).
