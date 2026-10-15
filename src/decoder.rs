@@ -23,8 +23,7 @@ const BUFFER_SIZE: usize = 8192;
 /// The outcome of replaying the next description or emission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayOutcome {
-    /// One description or emission was dispatched to the current recorder.
-    /// The recorder may filter it out.
+    /// One description or emission was replayed.
     Replayed,
     /// No further events will be replayed.
     EndOfStream,
@@ -32,7 +31,6 @@ pub enum ReplayOutcome {
 
 /// Replays descriptions and emissions from a serialized metric stream.
 ///
-/// Replay uses the current recorder via [`metrics::with_recorder`] after decoding each event.
 /// Truncated input returns an error. Errors end replay and do not undo earlier events.
 pub struct BlockingDecoder<R> {
     reader: R,
@@ -157,8 +155,6 @@ impl<R: Read> BlockingDecoder<R> {
 }
 
 /// The asynchronous counterpart to [`BlockingDecoder`], accepting an asynchronous byte stream.
-///
-/// Replay resolves the current recorder after awaiting input; no recorder is held across an await.
 #[cfg(feature = "async-runtime")]
 pub struct Decoder<R> {
     inner: BlockingDecoder<R>,
@@ -188,7 +184,6 @@ impl<R: AsyncRead + Unpin> Decoder<R> {
     /// Description names are mapped as keys without labels. Map names consistently across
     /// descriptions and emissions so they remain associated. Canceling this call does not skip
     /// an event. Follows [`BlockingDecoder`]'s error behavior.
-    /// The future is `Send` when the reader and mapping are `Send`.
     pub async fn replay_next_with(
         &mut self,
         map_key: impl FnOnce(Key) -> Key,
