@@ -4,7 +4,7 @@ use metrics::{GaugeValue, Key, KeyName, Label, Level, Metadata, SharedString, Un
 use metrics_util::MetricKind;
 
 use crate::{
-    ErrorKind, ReplayOutcome,
+    ErrorKind,
     proto::{self, counter_operation, gauge_operation},
 };
 
@@ -72,60 +72,52 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn replay_with(self, map_key: impl FnOnce(Key) -> Option<Key>) -> ReplayOutcome {
-        metrics::with_recorder(|recorder| {
-            match self {
-                Self::Description(description) => {
-                    let Some(key) = map_key(Key::from_name(description.name)) else {
-                        return ReplayOutcome::Skipped;
-                    };
-                    let name = key.into_parts().0;
-                    match description.kind {
-                        MetricKind::Counter => {
-                            recorder.describe_counter(name, description.unit, description.text)
-                        }
-                        MetricKind::Gauge => {
-                            recorder.describe_gauge(name, description.unit, description.text)
-                        }
-                        MetricKind::Histogram => {
-                            recorder.describe_histogram(name, description.unit, description.text)
-                        }
+    pub fn replay_with(self, map_key: impl FnOnce(Key) -> Key) {
+        metrics::with_recorder(|recorder| match self {
+            Self::Description(description) => {
+                let name = map_key(Key::from_name(description.name)).into_parts().0;
+                match description.kind {
+                    MetricKind::Counter => {
+                        recorder.describe_counter(name, description.unit, description.text)
                     }
-                }
-                Self::Emission(emission) => {
-                    let registration = Arc::try_unwrap(emission.registration)
-                        .unwrap_or_else(|registration| (*registration).clone());
-                    let Some(key) = map_key(registration.key) else {
-                        return ReplayOutcome::Skipped;
-                    };
-                    let metadata = Metadata::new(
-                        &registration.target,
-                        registration.level,
-                        registration.module_path.as_deref(),
-                    );
-                    match emission.operation {
-                        Operation::IncrementCounter(value) => {
-                            recorder.register_counter(&key, &metadata).increment(value)
-                        }
-                        Operation::AbsoluteCounter(value) => {
-                            recorder.register_counter(&key, &metadata).absolute(value)
-                        }
-                        Operation::Gauge(GaugeValue::Increment(value)) => {
-                            recorder.register_gauge(&key, &metadata).increment(value)
-                        }
-                        Operation::Gauge(GaugeValue::Decrement(value)) => {
-                            recorder.register_gauge(&key, &metadata).decrement(value)
-                        }
-                        Operation::Gauge(GaugeValue::Absolute(value)) => {
-                            recorder.register_gauge(&key, &metadata).set(value)
-                        }
-                        Operation::Histogram { value, count } => recorder
-                            .register_histogram(&key, &metadata)
-                            .record_many(value, count),
+                    MetricKind::Gauge => {
+                        recorder.describe_gauge(name, description.unit, description.text)
+                    }
+                    MetricKind::Histogram => {
+                        recorder.describe_histogram(name, description.unit, description.text)
                     }
                 }
             }
-            ReplayOutcome::Replayed
+            Self::Emission(emission) => {
+                let registration = Arc::try_unwrap(emission.registration)
+                    .unwrap_or_else(|registration| (*registration).clone());
+                let key = map_key(registration.key);
+                let metadata = Metadata::new(
+                    &registration.target,
+                    registration.level,
+                    registration.module_path.as_deref(),
+                );
+                match emission.operation {
+                    Operation::IncrementCounter(value) => {
+                        recorder.register_counter(&key, &metadata).increment(value)
+                    }
+                    Operation::AbsoluteCounter(value) => {
+                        recorder.register_counter(&key, &metadata).absolute(value)
+                    }
+                    Operation::Gauge(GaugeValue::Increment(value)) => {
+                        recorder.register_gauge(&key, &metadata).increment(value)
+                    }
+                    Operation::Gauge(GaugeValue::Decrement(value)) => {
+                        recorder.register_gauge(&key, &metadata).decrement(value)
+                    }
+                    Operation::Gauge(GaugeValue::Absolute(value)) => {
+                        recorder.register_gauge(&key, &metadata).set(value)
+                    }
+                    Operation::Histogram { value, count } => recorder
+                        .register_histogram(&key, &metadata)
+                        .record_many(value, count),
+                }
+            }
         })
     }
 }
@@ -642,7 +634,7 @@ mod tests {
             Operation::AbsoluteCounter(5),
             Operation::IncrementCounter(2),
         ] {
-            emission(operation).replay_with(Some);
+            emission(operation).replay_with(|key| key);
         }
         assert_eq!(value(&recorder), DebugValue::Counter(22));
     }
@@ -656,7 +648,7 @@ mod tests {
             Operation::Gauge(GaugeValue::Increment(2.0)),
             Operation::Gauge(GaugeValue::Decrement(3.0)),
         ] {
-            emission(operation).replay_with(Some);
+            emission(operation).replay_with(|key| key);
         }
         assert_eq!(value(&recorder), DebugValue::Gauge(6.0.into()));
     }
@@ -682,7 +674,7 @@ mod tests {
             event.replay_with(|key| {
                 let (name, mut labels) = key.into_parts();
                 labels.push(peer);
-                Some(Key::from_parts(format!("client_{}", name.as_str()), labels))
+                Key::from_parts(format!("client_{}", name.as_str()), labels)
             });
         }
         let values = recorder.snapshotter().snapshot().into_vec();
@@ -714,7 +706,7 @@ mod tests {
             }),
             operation: Operation::IncrementCounter(1),
         });
-        original.replay_with(Some);
+        original.replay_with(|key| key);
         let shared = recorder::shared(&recorder);
         let received = shared.state.lock().unwrap().take_emissions().pop().unwrap();
         assert_eq!(received.registration.key, key);
@@ -741,7 +733,7 @@ mod tests {
                 unit: Some(Unit::Count),
                 text: "description".into(),
             })
-            .replay_with(Some);
+            .replay_with(|key| key);
             let shared = recorder::shared(&recorder);
             let state = shared.state.lock().unwrap();
             assert_eq!(state.descriptions.len(), 1);
@@ -785,7 +777,7 @@ mod tests {
         let recorder = HistogramSink::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
         for count in [0, usize::MAX] {
-            emission(Operation::Histogram { value: 1.5, count }).replay_with(Some);
+            emission(Operation::Histogram { value: 1.5, count }).replay_with(|key| key);
         }
         assert_eq!(
             *recorder.0.lock().unwrap(),

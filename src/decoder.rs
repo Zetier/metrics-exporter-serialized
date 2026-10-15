@@ -23,11 +23,9 @@ const BUFFER_SIZE: usize = 8192;
 /// The outcome of replaying the next description or emission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayOutcome {
-    /// One description or emission was replayed.
+    /// One description or emission was dispatched to the current recorder.
+    /// The recorder may filter it out.
     Replayed,
-    /// One description or emission was consumed but rejected by the key mapping.
-    /// Only filtered replay methods return this outcome; it does not indicate EOF.
-    Skipped,
     /// No further events will be replayed.
     EndOfStream,
 }
@@ -71,20 +69,10 @@ impl<R: Read> BlockingDecoder<R> {
         &mut self,
         map_key: impl FnOnce(Key) -> Key,
     ) -> Result<ReplayOutcome, Error> {
-        self.replay_next_filtered_with(|key| Some(map_key(key)))
-    }
-
-    /// Consumes one event, replaying it into the current recorder if the mapping returns a key.
-    ///
-    /// Description names arrive as keys without labels. Map names consistently across
-    /// descriptions and emissions. A rejected event returns [`ReplayOutcome::Skipped`].
-    pub fn replay_next_filtered_with(
-        &mut self,
-        map_key: impl FnOnce(Key) -> Option<Key>,
-    ) -> Result<ReplayOutcome, Error> {
         let event = self.decode_next()?;
         if let Some(event) = event {
-            Ok(event.replay_with(map_key))
+            event.replay_with(map_key);
+            Ok(ReplayOutcome::Replayed)
         } else {
             Ok(ReplayOutcome::EndOfStream)
         }
@@ -205,23 +193,10 @@ impl<R: AsyncRead + Unpin> Decoder<R> {
         &mut self,
         map_key: impl FnOnce(Key) -> Key,
     ) -> Result<ReplayOutcome, Error> {
-        self.replay_next_filtered_with(|key| Some(map_key(key)))
-            .await
-    }
-
-    /// Consumes one event, replaying it into the current recorder if the mapping returns a key.
-    ///
-    /// Description names arrive as keys without labels. Map names consistently across
-    /// descriptions and emissions. A rejected event returns [`ReplayOutcome::Skipped`].
-    /// Cancellation does not skip an event. The future is `Send` when the reader and mapping
-    /// are `Send`.
-    pub async fn replay_next_filtered_with(
-        &mut self,
-        map_key: impl FnOnce(Key) -> Option<Key>,
-    ) -> Result<ReplayOutcome, Error> {
         let event = self.decode_next().await?;
         if let Some(event) = event {
-            Ok(event.replay_with(map_key))
+            event.replay_with(map_key);
+            Ok(ReplayOutcome::Replayed)
         } else {
             Ok(ReplayOutcome::EndOfStream)
         }
@@ -335,16 +310,14 @@ mod tests {
         }
     }
 
-    use metrics::{Label, Level, Unit};
+    use metrics::Level;
     use std::{cell::Cell, rc::Rc, sync::Arc};
 
     use proptest::prelude::*;
     use prost::Message;
 
     use super::*;
-    use crate::{
-        Builder, Compression, DeflateLevel, Emission, Operation, Recorder, Registration, proto,
-    };
+    use crate::{Compression, DeflateLevel, Emission, Operation, Recorder, Registration, proto};
     use flate2::{Compression as DeflateCompression, write::DeflateEncoder};
     use std::io::Write;
 
@@ -441,81 +414,15 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn filtered_replay_skips_descriptions_and_emissions_and_maps_admitted_names() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-        let (source, mut output) = Builder::new().build_blocking();
-        metrics::with_local_recorder(&source, || {
-            metrics::describe_counter!("secret", "Private");
-            metrics::counter!("secret").increment(100);
-            metrics::describe_counter!("requests", Unit::Count, "Requests");
-            metrics::counter!("requests", "route" => "test").increment(7);
-        });
-        let bytes = output.export_pending().unwrap().unwrap();
-        let mut decoder = BlockingDecoder::new(bytes.as_slice());
-        let destination = DebuggingRecorder::new();
-        let _guard = metrics::set_default_local_recorder(&destination);
-        let mut skipped = 0;
-        let mut replayed = 0;
-        loop {
-            match decoder
-                .replay_next_filtered_with(|key| {
-                    if key.name() == "secret" {
-                        return None;
-                    }
-                    let (name, labels) = key.into_parts();
-                    Some(Key::from_parts(format!("client_{}", name.as_str()), labels))
-                })
-                .unwrap()
-            {
-                ReplayOutcome::Skipped => skipped += 1,
-                ReplayOutcome::Replayed => replayed += 1,
-                ReplayOutcome::EndOfStream => break,
-            }
-        }
-        assert_eq!((skipped, replayed), (2, 2));
-        metrics::counter!("secret").increment(1);
-        let snapshot = destination.snapshotter().snapshot().into_vec();
-        assert_eq!(snapshot.len(), 2);
-        let (key, unit, text, value) = snapshot
-            .iter()
-            .find(|(key, ..)| key.key().name() == "client_requests")
-            .unwrap();
-        assert_eq!(*unit, Some(Unit::Count));
-        assert_eq!(text.as_deref(), Some("Requests"));
-        assert_eq!(*value, DebugValue::Counter(7));
-        assert_eq!(
-            key.key().labels().cloned().collect::<Vec<_>>(),
-            [Label::new("route", "test")]
-        );
-        let (_, unit, text, value) = snapshot
-            .iter()
-            .find(|(key, ..)| key.key().name() == "secret")
-            .unwrap();
-        assert_eq!((*unit, text.as_deref()), (None, None));
-        assert_eq!(*value, DebugValue::Counter(1));
-    }
-
     #[cfg(feature = "async-runtime")]
     #[tokio::test]
-    async fn mapped_and_filtered_replay_can_run_in_a_send_task() {
+    async fn mapped_replay_can_run_in_a_send_task() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-        let bytes = encode(
-            vec![counter_event(100), counter_event(7)],
-            Compression::default(),
-        )
-        .unwrap();
+        let bytes = encode(vec![counter_event(7)], Compression::default()).unwrap();
         let task = tokio::spawn(async move {
             let destination = DebuggingRecorder::new();
             let mut decoder = Decoder::new(bytes.as_slice());
-            assert_eq!(
-                poll_with_recorder(&destination, decoder.replay_next_filtered_with(|_| None))
-                    .await
-                    .unwrap(),
-                ReplayOutcome::Skipped
-            );
             assert_eq!(
                 poll_with_recorder(&destination, decoder.replay_next_with(|key| key))
                     .await
@@ -523,7 +430,7 @@ mod tests {
                 ReplayOutcome::Replayed
             );
             assert_eq!(
-                poll_with_recorder(&destination, decoder.replay_next_filtered_with(Some))
+                poll_with_recorder(&destination, decoder.replay_next())
                     .await
                     .unwrap(),
                 ReplayOutcome::EndOfStream
