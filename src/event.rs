@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use metrics::{
-    GaugeValue, Key, KeyName, Label, Level, Metadata, Recorder as MetricRecorder, SharedString,
-    Unit,
-};
+use metrics::{GaugeValue, Key, KeyName, Label, Level, Metadata, SharedString, Unit};
 use metrics_util::MetricKind;
 
 use crate::{
@@ -75,63 +72,61 @@ pub enum Event {
 }
 
 impl Event {
-    pub fn replay_with<R: MetricRecorder + ?Sized>(
-        self,
-        recorder: &R,
-        map_key: impl FnOnce(Key) -> Option<Key>,
-    ) -> ReplayOutcome {
-        match self {
-            Self::Description(description) => {
-                let Some(key) = map_key(Key::from_name(description.name)) else {
-                    return ReplayOutcome::Skipped;
-                };
-                let name = key.into_parts().0;
-                match description.kind {
-                    MetricKind::Counter => {
-                        recorder.describe_counter(name, description.unit, description.text)
+    pub fn replay_with(self, map_key: impl FnOnce(Key) -> Option<Key>) -> ReplayOutcome {
+        metrics::with_recorder(|recorder| {
+            match self {
+                Self::Description(description) => {
+                    let Some(key) = map_key(Key::from_name(description.name)) else {
+                        return ReplayOutcome::Skipped;
+                    };
+                    let name = key.into_parts().0;
+                    match description.kind {
+                        MetricKind::Counter => {
+                            recorder.describe_counter(name, description.unit, description.text)
+                        }
+                        MetricKind::Gauge => {
+                            recorder.describe_gauge(name, description.unit, description.text)
+                        }
+                        MetricKind::Histogram => {
+                            recorder.describe_histogram(name, description.unit, description.text)
+                        }
                     }
-                    MetricKind::Gauge => {
-                        recorder.describe_gauge(name, description.unit, description.text)
-                    }
-                    MetricKind::Histogram => {
-                        recorder.describe_histogram(name, description.unit, description.text)
+                }
+                Self::Emission(emission) => {
+                    let registration = Arc::try_unwrap(emission.registration)
+                        .unwrap_or_else(|registration| (*registration).clone());
+                    let Some(key) = map_key(registration.key) else {
+                        return ReplayOutcome::Skipped;
+                    };
+                    let metadata = Metadata::new(
+                        &registration.target,
+                        registration.level,
+                        registration.module_path.as_deref(),
+                    );
+                    match emission.operation {
+                        Operation::IncrementCounter(value) => {
+                            recorder.register_counter(&key, &metadata).increment(value)
+                        }
+                        Operation::AbsoluteCounter(value) => {
+                            recorder.register_counter(&key, &metadata).absolute(value)
+                        }
+                        Operation::Gauge(GaugeValue::Increment(value)) => {
+                            recorder.register_gauge(&key, &metadata).increment(value)
+                        }
+                        Operation::Gauge(GaugeValue::Decrement(value)) => {
+                            recorder.register_gauge(&key, &metadata).decrement(value)
+                        }
+                        Operation::Gauge(GaugeValue::Absolute(value)) => {
+                            recorder.register_gauge(&key, &metadata).set(value)
+                        }
+                        Operation::Histogram { value, count } => recorder
+                            .register_histogram(&key, &metadata)
+                            .record_many(value, count),
                     }
                 }
             }
-            Self::Emission(emission) => {
-                let registration = Arc::try_unwrap(emission.registration)
-                    .unwrap_or_else(|registration| (*registration).clone());
-                let Some(key) = map_key(registration.key) else {
-                    return ReplayOutcome::Skipped;
-                };
-                let metadata = Metadata::new(
-                    &registration.target,
-                    registration.level,
-                    registration.module_path.as_deref(),
-                );
-                match emission.operation {
-                    Operation::IncrementCounter(value) => {
-                        recorder.register_counter(&key, &metadata).increment(value)
-                    }
-                    Operation::AbsoluteCounter(value) => {
-                        recorder.register_counter(&key, &metadata).absolute(value)
-                    }
-                    Operation::Gauge(GaugeValue::Increment(value)) => {
-                        recorder.register_gauge(&key, &metadata).increment(value)
-                    }
-                    Operation::Gauge(GaugeValue::Decrement(value)) => {
-                        recorder.register_gauge(&key, &metadata).decrement(value)
-                    }
-                    Operation::Gauge(GaugeValue::Absolute(value)) => {
-                        recorder.register_gauge(&key, &metadata).set(value)
-                    }
-                    Operation::Histogram { value, count } => recorder
-                        .register_histogram(&key, &metadata)
-                        .record_many(value, count),
-                }
-            }
-        }
-        ReplayOutcome::Replayed
+            ReplayOutcome::Replayed
+        })
     }
 }
 
@@ -304,7 +299,7 @@ mod tests {
     }
 
     use crate::recorder;
-    use metrics::{Counter, Gauge, Histogram, HistogramFn};
+    use metrics::{Counter, Gauge, Histogram, HistogramFn, Recorder as MetricRecorder};
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use proptest::prelude::*;
     use std::sync::Mutex;
@@ -640,13 +635,14 @@ mod tests {
     #[test]
     fn replay_preserves_monotonic_absolute_counter_semantics() {
         let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         for operation in [
             Operation::IncrementCounter(3),
             Operation::AbsoluteCounter(20),
             Operation::AbsoluteCounter(5),
             Operation::IncrementCounter(2),
         ] {
-            emission(operation).replay_with(&recorder, Some);
+            emission(operation).replay_with(Some);
         }
         assert_eq!(value(&recorder), DebugValue::Counter(22));
     }
@@ -654,12 +650,13 @@ mod tests {
     #[test]
     fn replay_applies_each_gauge_operation() {
         let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         for operation in [
             Operation::Gauge(GaugeValue::Absolute(7.0)),
             Operation::Gauge(GaugeValue::Increment(2.0)),
             Operation::Gauge(GaugeValue::Decrement(3.0)),
         ] {
-            emission(operation).replay_with(&recorder, Some);
+            emission(operation).replay_with(Some);
         }
         assert_eq!(value(&recorder), DebugValue::Gauge(6.0.into()));
     }
@@ -667,6 +664,7 @@ mod tests {
     #[test]
     fn replay_maps_description_names_and_emission_keys_consistently() {
         let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let description = Event::Description(Description {
             kind: MetricKind::Counter,
             name: "requests".into(),
@@ -681,7 +679,7 @@ mod tests {
             Key::from_parts("requests", vec![Label::new("route", "/")]);
         for event in [description, event] {
             let peer = Label::new("peer", "a");
-            event.replay_with(&recorder, |key| {
+            event.replay_with(|key| {
                 let (name, mut labels) = key.into_parts();
                 labels.push(peer);
                 Some(Key::from_parts(format!("client_{}", name.as_str()), labels))
@@ -705,6 +703,7 @@ mod tests {
     #[test]
     fn replay_passes_registration_context_to_the_receiving_recorder() {
         let recorder = crate::Recorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         let key = Key::from_parts("requests", vec![Label::new("route", "/")]);
         let original = Event::Emission(Emission {
             registration: Arc::new(Registration {
@@ -715,7 +714,7 @@ mod tests {
             }),
             operation: Operation::IncrementCounter(1),
         });
-        original.replay_with(&recorder, Some);
+        original.replay_with(Some);
         let shared = recorder::shared(&recorder);
         let received = shared.state.lock().unwrap().take_emissions().pop().unwrap();
         assert_eq!(received.registration.key, key);
@@ -735,13 +734,14 @@ mod tests {
             MetricKind::Histogram,
         ] {
             let recorder = crate::Recorder::default();
+            let _guard = metrics::set_default_local_recorder(&recorder);
             Event::Description(Description {
                 kind,
                 name: "measurement".into(),
                 unit: Some(Unit::Count),
                 text: "description".into(),
             })
-            .replay_with(&recorder, Some);
+            .replay_with(Some);
             let shared = recorder::shared(&recorder);
             let state = shared.state.lock().unwrap();
             assert_eq!(state.descriptions.len(), 1);
@@ -783,8 +783,9 @@ mod tests {
         }
 
         let recorder = HistogramSink::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
         for count in [0, usize::MAX] {
-            emission(Operation::Histogram { value: 1.5, count }).replay_with(&recorder, Some);
+            emission(Operation::Histogram { value: 1.5, count }).replay_with(Some);
         }
         assert_eq!(
             *recorder.0.lock().unwrap(),

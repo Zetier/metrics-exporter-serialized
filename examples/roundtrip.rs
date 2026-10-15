@@ -21,9 +21,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let destination = DebuggingRecorder::new();
+    let _guard = metrics::set_default_local_recorder(&destination);
     let bytes = output.export_pending()?.expect("recorded metrics");
     let mut decoder = BlockingDecoder::new(bytes.as_slice());
-    while let ReplayOutcome::Replayed = decoder.replay_next_with(&destination, |key| {
+    while let ReplayOutcome::Replayed = decoder.replay_next_with(|key| {
         let (name, labels) = key.into_parts();
         Key::from_parts(format!("client_{}", name.as_str()), labels)
     })? {}

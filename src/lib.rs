@@ -16,10 +16,11 @@
 //!     metrics::histogram!("request_duration_seconds").record(0.125);
 //! });
 //! let destination = DebuggingRecorder::new();
+//! let _guard = metrics::set_default_local_recorder(&destination);
 //! let batch = output.export_pending().unwrap().unwrap();
 //! let mut decoder = BlockingDecoder::new(batch.as_slice());
 //! assert_eq!(
-//!     decoder.replay_next_with(&destination, |key| key).unwrap(),
+//!     decoder.replay_next().unwrap(),
 //!     ReplayOutcome::Replayed,
 //! );
 //! let received = destination.snapshotter().snapshot().into_vec();
@@ -55,4 +56,4 @@ use event::{Description, Emission, Event, Operation, Registration};
 pub use output::BlockingOutput;
 #[cfg(feature = "async-runtime")]
 pub use output::Output;
-pub use recorder::{Recorder, SessionError};
+pub use recorder::Recorder;
