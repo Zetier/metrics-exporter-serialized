@@ -18,13 +18,12 @@ API uses `BlockingOutput`, `BlockingDecoder`, and `std::io::Read`.
 
 `Decoder::replay_next()` replays one description or emission into the current recorder.
 All replay methods use `metrics::with_recorder()` after decoding each event.
-Use `replay_next_with()` to map metric keys.
-Use `replay_next_filtered_with()` to return `Some(key)` for admitted events or `None` to skip
-them. Description names are mapped as keys without labels. Apply the same name mapping to
-descriptions and emissions. Continue after both `ReplayOutcome::Replayed` and
-`ReplayOutcome::Skipped`; only `EndOfStream` indicates completion. The unfiltered methods
-never return `Skipped`. Async replay produces a `Send` future when the reader and mapping
-are `Send`; it does not hold a recorder reference while awaiting input.
+Use `replay_next_with()` to map metric keys. Description names are mapped as keys without
+labels; apply the same name mapping to descriptions and emissions. Filtering belongs to the
+receiving recorder. `ReplayOutcome::Replayed` means the event was dispatched to that recorder,
+which may filter it out; `EndOfStream` indicates completion. Async replay produces a `Send`
+future when the reader and mapping are `Send`; it does not hold a recorder reference while
+awaiting input.
 
 Compression defaults to raw DEFLATE and can be disabled through `Builder::compression()`.
 The decoder reads the compression scheme from the stream. See the [protobuf schema](proto/metrics.proto).
