@@ -55,4 +55,4 @@ use event::{Description, Emission, Event, Operation, Registration};
 pub use output::BlockingOutput;
 #[cfg(feature = "async-runtime")]
 pub use output::Output;
-pub use recorder::Recorder;
+pub use recorder::{Recorder, SessionError};
