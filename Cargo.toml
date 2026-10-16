@@ -1,6 +1,6 @@
 [package]
 name = "metrics-exporter-serialized"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
     "ApertureC Team <aperturec@zetier.com>",
     "Joe Kale <joe@zetier.com>",
