@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/Zetier/metrics-exporter-serialized/compare/v0.1.0...v0.2.0) - 2026-10-16
+
+### Added
+
+- [**breaking**] add reusable recorder sessions and filtered replay
+
+### Other
+
+- remove redundant replay explanations
+- leave replay filtering to the receiving recorder
+- [**breaking**] scope replay to the current metrics recorder
+
 ## [0.1.0](https://github.com/Zetier/metrics-exporter-serialized/releases/tag/v0.1.0) - 2026-10-15
 
 ### Added
